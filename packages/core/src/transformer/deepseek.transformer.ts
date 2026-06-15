@@ -8,6 +8,30 @@ export class DeepseekTransformer implements Transformer {
     if (request.max_tokens && request.max_tokens > 8192) {
       request.max_tokens = 8192; // DeepSeek has a max token limit of 8192
     }
+    // I modelli reasoning di DeepSeek (deepseek-v4-*) pretendono che i messaggi assistant
+    // con tool_calls riportino il reasoning_content, altrimenti rispondono 400
+    // "reasoning_content ... must be passed back". Claude Code NON rimanda il pensiero a
+    // ccr (i messaggi assistant arrivano privi sia di reasoning_content sia di thinking),
+    // quindi il reasoning originale e' perso. DeepSeek valida la PRESENZA del campo, non il
+    // contenuto: se disponibile usiamo il thinking conservato, altrimenti un placeholder.
+    if (Array.isArray(request.messages)) {
+      for (const message of request.messages as any[]) {
+        if (message?.role !== "assistant") continue;
+        if (message.thinking) {
+          if (message.thinking.content && !message.reasoning_content) {
+            message.reasoning_content = message.thinking.content;
+          }
+          delete message.thinking; // campo non standard per DeepSeek
+        }
+        if (
+          Array.isArray(message.tool_calls) &&
+          message.tool_calls.length &&
+          !message.reasoning_content
+        ) {
+          message.reasoning_content = "(reasoning non disponibile)";
+        }
+      }
+    }
     return request;
   }
 
@@ -94,16 +118,21 @@ export class DeepseekTransformer implements Transformer {
                   return;
                 }
 
-                // Check if reasoning is complete (when delta has content but no reasoning_content)
+                // Reasoning completo quando arriva il primo content O tool_calls dopo il
+                // reasoning_content. Includere tool_calls e' essenziale: senza, il blocco
+                // thinking che precede una tool call non riceverebbe mai la signature e
+                // verrebbe scartato a valle (rompendo il round-trip del reasoning_content).
                 if (
-                  data.choices?.[0]?.delta?.content &&
+                  (data.choices?.[0]?.delta?.content ||
+                    data.choices?.[0]?.delta?.tool_calls) &&
                   context.reasoningContent() &&
                   !context.isReasoningComplete()
                 ) {
                   context.setReasoningComplete(true);
                   const signature = Date.now().toString();
 
-                  // Create a new chunk with thinking block
+                  // Chunk con SOLO il blocco thinking: content/tool_calls vengono azzerati
+                  // qui per non duplicarli (verranno emessi dal chunk dati successivo).
                   const thinkingChunk = {
                     ...data,
                     choices: [
@@ -112,6 +141,7 @@ export class DeepseekTransformer implements Transformer {
                         delta: {
                           ...data.choices[0].delta,
                           content: null,
+                          tool_calls: undefined,
                           thinking: {
                             content: context.reasoningContent(),
                             signature: signature,
